@@ -34,8 +34,26 @@ $arguments = @(
 )
 if ($Deterministic) { $arguments += '--deterministic' }
 try {
-    & $Python @arguments 2>&1 | Tee-Object -FilePath $LogPath
-    if ($LASTEXITCODE -ne 0) { throw "PPO evaluation failed; see $LogPath" }
+    $savedErrorActionPreference = $ErrorActionPreference
+    $hasNativePreference = Test-Path Variable:\PSNativeCommandUseErrorActionPreference
+    if ($hasNativePreference) {
+        $savedNativePreference = $PSNativeCommandUseErrorActionPreference
+        $PSNativeCommandUseErrorActionPreference = $false
+    }
+    try {
+        $ErrorActionPreference = 'Continue'
+        & $Python @arguments 2>&1 | Tee-Object -FilePath $LogPath
+        $pythonExitCode = $LASTEXITCODE
+    }
+    finally {
+        $ErrorActionPreference = $savedErrorActionPreference
+        if ($hasNativePreference) {
+            $PSNativeCommandUseErrorActionPreference = $savedNativePreference
+        }
+    }
+    if ($pythonExitCode -ne 0) {
+        throw "PPO evaluation failed with exit code $pythonExitCode; see $LogPath"
+    }
 }
 finally {
     Get-Process SC2_x64 -ErrorAction SilentlyContinue | Stop-Process -Force

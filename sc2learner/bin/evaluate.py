@@ -69,6 +69,10 @@ def create_dqn_agent(env):
 
   assert FLAGS.policy == 'mlp'
   assert not FLAGS.use_action_mask
+
+  print("env.observation_space.shape[0]:", env.observation_space.shape[0]) #1623
+  print("env.action_space.n:", env.action_space.n) #62
+
   network = NonspatialDuelingQNet(n_dims=env.observation_space.shape[0],
                                   n_out=env.action_space.n)
   agent = DQNAgent(

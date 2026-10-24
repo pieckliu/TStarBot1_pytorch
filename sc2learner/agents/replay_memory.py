@@ -55,9 +55,11 @@ class RemoteReplayMemory(object):
       self._zmq_context = zmq.Context()
 
       self._receiver_threads = [Thread(target=self._server_proxy_worker,
-                                       args=(self._zmq_context, ports,))]
+                                       args=(self._zmq_context, ports,),
+                                       daemon=True)]
       self._receiver_threads += [Thread(target=self._server_receiver_worker,
-                                        args=(self._zmq_context, ports[1],))
+                                        args=(self._zmq_context, ports[1],),
+                                        daemon=True)
                                  for _ in range(num_pull_threads)]
       for thread in self._receiver_threads: thread.start()
     else:
@@ -98,14 +100,26 @@ class RemoteReplayMemory(object):
     else:
       return self._memory.total
 
+  def close(self):
+    if not self._is_server:
+      self._sender.close(linger=0)
+    self._zmq_context.destroy(linger=0)
+    for thread in getattr(self, '_receiver_threads', []):
+      thread.join(timeout=1.0)
+
   def _server_receiver_worker(self, zmq_context, port):
     receiver = zmq_context.socket(zmq.PULL)
     receiver.connect("tcp://localhost:%s" % port)
-    while True:
-      block, delta = receiver.recv_pyobj()
-      self._cache_blocks.append(block)
-      self._total += delta
-      self._num_received += len(block)
+    try:
+      while True:
+        block, delta = receiver.recv_pyobj()
+        self._cache_blocks.append(block)
+        self._total += delta
+        self._num_received += len(block)
+    except zmq.ZMQError:
+      pass
+    finally:
+      receiver.close(linger=0)
 
   def _server_proxy_worker(self, zmq_context, ports):
     assert len(ports) == 2
@@ -113,7 +127,13 @@ class RemoteReplayMemory(object):
     frontend.bind("tcp://*:%s" % ports[0])
     backend = self._zmq_context.socket(zmq.PUSH)
     backend.bind("tcp://*:%s" % ports[1])
-    zmq.proxy(frontend, backend)
+    try:
+      zmq.proxy(frontend, backend)
+    except zmq.ZMQError:
+      pass
+    finally:
+      frontend.close(linger=0)
+      backend.close(linger=0)
 
 
 if __name__ == '__main__':

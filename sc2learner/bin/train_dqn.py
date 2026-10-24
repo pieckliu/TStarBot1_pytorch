@@ -59,6 +59,10 @@ flags.DEFINE_string("device", "auto", "PyTorch device: auto, cpu, cuda, or mps."
 flags.DEFINE_boolean("disable_fog", False, "Disable fog-of-war.")
 flags.DEFINE_boolean("use_all_combat_actions", False, "Use all combat actions.")
 flags.DEFINE_boolean("use_region_features", True, "Use region features")
+flags.DEFINE_integer("max_actor_episodes", 0,
+                     "Stop actor after N episodes; 0 keeps unlimited training.")
+flags.DEFINE_integer("max_learner_updates", 0,
+                     "Stop learner after N updates; 0 keeps unlimited training.")
 flags.FLAGS(sys.argv)
 
 
@@ -97,6 +101,7 @@ def start_actor_job():
   game_seed =  random.randint(0, 2**32 - 1)
   print("Game Seed: %d Difficulty: %s" % (game_seed, difficulty))
   env = create_env(difficulty, game_seed)
+  
   network = create_network(env)
   actor = DQNActor(memory_size=FLAGS.client_memory_size,
                    memory_warmup_size=FLAGS.client_memory_warmup_size,
@@ -107,7 +112,10 @@ def start_actor_job():
                    ports=FLAGS.ports.split(','),
                    learner_ip=FLAGS.learner_ip,
                    device=torch_device())
-  try: actor.run()
+  try:
+    completed = actor.run(max_rollouts=FLAGS.max_actor_episodes or None)
+    if FLAGS.max_actor_episodes:
+      print("DQN actor completed %d episode(s)." % completed)
   finally:
     actor.close()
     env.close()
@@ -140,8 +148,14 @@ def start_learner_job():
                        ports=FLAGS.ports.split(','),
                        init_model_path=FLAGS.init_model_path,
                        device=torch_device())
-  try: learner.run()
-  finally: env.close()
+  try:
+    metrics = learner.run(max_updates=FLAGS.max_learner_updates or None)
+    if FLAGS.max_learner_updates:
+      print("DQN learner completed %d update(s): %s" %
+            (FLAGS.max_learner_updates, metrics))
+  finally:
+    learner.close()
+    env.close()
 
 
 def main(argv):

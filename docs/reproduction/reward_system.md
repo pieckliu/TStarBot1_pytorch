@@ -18,6 +18,8 @@ Validated real-game results:
 - random agent run 1: 577 decision steps, terminal `+1`, normal completion;
 - random agent run 2 through the delivered script: 899 decision steps,
   terminal `0`, normal completion;
+- post-fix random script regression: terminal `+1`, normal completion despite
+  Gym's stderr deprecation notice;
 - one-update PPO checkpoint evaluation: 899 decision steps, terminal `0`,
   normal completion.
 

@@ -202,8 +202,9 @@ class DQNActor(object):
     self._model_requestor = self._zmq_context.socket(zmq.REQ)
     self._model_requestor.connect("tcp://%s:%s" % (learner_ip, ports[2]))
 
-  def run(self):
-    while True:
+  def run(self, max_rollouts=None):
+    produced = 0
+    while max_rollouts is None or produced < max_rollouts:
       # fetch model
       t = time.time()
       self._update_model()
@@ -212,6 +213,8 @@ class DQNActor(object):
       t = time.time()
       self._rollout()
       tprint("Rollout time: %f" % (time.time() - t))
+      produced += 1
+    return produced
 
   def _rollout(self):
     rollout, done = [], False
@@ -239,8 +242,8 @@ class DQNActor(object):
 
   def close(self):
     self._model_requestor.close(linger=0)
-    if hasattr(self._replay_memory, "close"):
-      self._replay_memory.close()
+    self._replay_memory.close()
+    self._zmq_context.destroy(linger=0)
 
 
 class DQNLearner(object):
@@ -297,23 +300,25 @@ class DQNLearner(object):
 
     self._zmq_context = zmq.Context()
     self._reply_model_thread = Thread(
-        target=self._reply_model, args=(self._zmq_context, ports[2]))
+        target=self._reply_model, args=(self._zmq_context, ports[2]),
+        daemon=True)
     self._reply_model_thread.start()
 
-  def run(self):
+  def run(self, max_updates=None):
     batch_queue = queue.Queue(8)
     batch_thread = Thread(target=self._prepare_batch,
-                          args=(batch_queue, self._batch_size,))
+                          args=(batch_queue, self._batch_size,), daemon=True)
     batch_thread.start()
 
     updates, loss, total_rollout_frames = 0, [], 0
     time_start = time.time()
-    while True:
+    last_loss = None
+    while max_updates is None or updates < max_updates:
       updates += 1
       observation, next_observation, action, reward, done, mc_return = \
           batch_queue.get()
       self._epsilon = self._schedule_epsilon(updates)
-      loss.append(self._agent.optimize_step(
+      last_loss = self._agent.optimize_step(
           obs_batch=observation,
           next_obs_batch=next_observation,
           action_batch=action,
@@ -325,7 +330,8 @@ class DQNLearner(object):
           gradient_clipping=self._gradient_clipping,
           adam_eps=self._adam_eps,
           learning_rate=self._learning_rate,
-          target_update_interval=self._target_update_interval))
+          target_update_interval=self._target_update_interval)
+      loss.append(last_loss)
       self._model_params = self._agent.read_params()
       if updates % self._checkpoint_interval == 0:
         ckpt_path = os.path.join(self._checkpoint_dir,
@@ -342,6 +348,17 @@ class DQNLearner(object):
                rollout_fps, loss_mean, self._epsilon, time_elapsed))
         time_start, loss = time.time(), []
         total_rollout_frames = self._replay_memory.total
+    return {
+        "updates": updates,
+        "loss": last_loss,
+        "epsilon": self._epsilon,
+        "replay_total": self._replay_memory.total,
+    }
+
+  def close(self):
+    self._replay_memory.close()
+    self._zmq_context.destroy(linger=0)
+    self._reply_model_thread.join(timeout=1.0)
 
   def _prepare_batch(self, batch_queue, batch_size):
     while True:
@@ -379,10 +396,15 @@ class DQNLearner(object):
   def _reply_model(self, zmq_context, port):
     receiver = zmq_context.socket(zmq.REP)
     receiver.bind("tcp://*:%s" % port)
-    while True:
-      assert receiver.recv_string() == "request model"
-      receiver.send_pyobj({
-          "protocol_version": DQN_PROTOCOL_VERSION,
-          "parameters": self._model_params,
-          "epsilon": self._epsilon,
-      })
+    try:
+      while True:
+        assert receiver.recv_string() == "request model"
+        receiver.send_pyobj({
+            "protocol_version": DQN_PROTOCOL_VERSION,
+            "parameters": self._model_params,
+            "epsilon": self._epsilon,
+        })
+    except zmq.ZMQError:
+      pass
+    finally:
+      receiver.close(linger=0)

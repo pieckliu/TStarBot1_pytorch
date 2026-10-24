@@ -94,6 +94,8 @@ class NonspatialDuelingQNet(nn.Module):
     self.adv_fc4 = nn.Linear(256, n_out)
 
   def forward(self, x):
+    # print("NonspatialDuelingQNet input x:", x.shape) #[8, 1623]
+    
     value = F.relu(self.value_fc1(x))
     value = F.relu(self.value_fc2(value))
     value = F.relu(self.value_fc3(value))
@@ -105,4 +107,7 @@ class NonspatialDuelingQNet(nn.Module):
     adv = self.adv_fc4(adv)
 
     adv_subtract = adv - adv.mean(dim=1, keepdim=True)
+    
+    print("adv_subtract:", adv_subtract.shape) #[8, 62]
+    
     return value + adv_subtract
