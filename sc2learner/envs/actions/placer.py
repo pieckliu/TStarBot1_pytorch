@@ -89,7 +89,7 @@ class Placer(object):
                     expand_mineral=False, shrink_mineral=False):
     bottomleft = tuple(map(int, search_region[:2]))
     size = tuple(map(int, search_region[2:]))
-    grids = np.zeros(size).astype(np.int)
+    grids = np.zeros(size).astype(int)
     if remove_corner:
       cx, cy = size[0] / 2.0, size[1] / 2.0
       r = max(size[0] / 2.0, size[1] / 2.0)

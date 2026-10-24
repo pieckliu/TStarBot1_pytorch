@@ -47,6 +47,9 @@ python -m pytest -m "not sc2"
 TensorFlow is not required. See [`docs/environment.md`](docs/environment.md)
 for the separate SC2 compatibility procedure.
 
+For the tested Windows commands and observed smoke-test results, see
+[`docs/reproduction/reproduction_report.md`](docs/reproduction/reproduction_report.md).
+
 ## Getting Started
 
 ### Run local PyTorch PPO without StarCraft II
