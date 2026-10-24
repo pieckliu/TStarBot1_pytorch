@@ -94,6 +94,16 @@ ZeroMQ Python-object serialization is intended only for trusted worker networks.
 
 Similarly, DQN algorithm can be tried with `sc2learner.bin.train_dqn`.
 
+On the validated Windows environment, run a bounded real-SC2 DQN
+actor/learner test with:
+
+```powershell
+.\scripts\train_dqn_smoke.ps1
+```
+
+The script directly uses `tstarbot1_pytorch_env`, regardless of which Python
+environment is active in the current shell.
+
 ### Evaluate PPO Agent
 After training, the agent's in-game performance can be observed by letting it play the game against a build-in AI of a certain difficulty level.
 Win-rate is also estimated meanwhile with multiple such games initialized with different game seeds.

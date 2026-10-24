@@ -126,17 +126,23 @@ class ZergActionWrapper(gym.Wrapper):
         self._combat_mgr.action_framewise_rally_and_attack
     ]
 
-    if mask: self.action_space = MaskDiscrete(len(self._actions))
-    else: self.action_space = Discrete(len(self._actions))
+    if mask: 
+      self.action_space = MaskDiscrete(len(self._actions))
+    else: 
+      self.action_space = Discrete(len(self._actions))
 
   def step(self, action):
     actions = self._actions[action].function(self._dc)
+    
     pre_actions, post_actions = self._required_actions()
+    
     observation, reward, done, info = self.env.step(
         pre_actions + actions + post_actions)
+    
     self._dc.update(observation)
     if isinstance(self.action_space, MaskDiscrete):
       observation['action_mask'] = self._get_valid_action_mask()
+    
     return observation, reward, done, info
 
   def reset(self, **kwargs):
