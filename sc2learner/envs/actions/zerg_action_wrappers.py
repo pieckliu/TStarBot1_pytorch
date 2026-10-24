@@ -172,7 +172,7 @@ class ZergActionWrapper(gym.Wrapper):
   def _get_valid_action_mask(self):
     ids = [i for i, action in enumerate(self._actions)
            if action.is_valid(self._dc)]
-    mask = np.zeros(self.action_space.n)
+    mask = np.zeros(self.action_space.n, dtype=np.float32)
     mask[ids] = 1
     return mask
 

@@ -51,6 +51,10 @@ flags.DEFINE_boolean("use_all_combat_actions", False, "Use all combat actions.")
 flags.DEFINE_boolean("use_region_features", False, "Use region features")
 flags.DEFINE_boolean("use_action_mask", True, "Use region-wise combat.")
 flags.DEFINE_boolean("use_reward_shaping", False, "Use reward shaping.")
+flags.DEFINE_integer("max_actor_unrolls", 0,
+                     "Stop actor after N unrolls; 0 keeps original unlimited behavior.")
+flags.DEFINE_integer("max_learner_updates", 0,
+                     "Stop learner after N updates; 0 keeps original unlimited behavior.")
 flags.FLAGS(sys.argv)
 
 
@@ -102,7 +106,10 @@ def start_actor():
                    port_B=FLAGS.port_B,
                    device=torch_device())
   try:
-    actor.run()
+    produced = actor.run(
+        max_unrolls=FLAGS.max_actor_unrolls or None)
+    if FLAGS.max_actor_unrolls:
+      print("Actor completed %d unroll(s)." % produced)
   finally:
     actor.close()
     env.close()
@@ -131,7 +138,11 @@ def start_learner():
                        port_B=FLAGS.port_B,
                        device=torch_device())
   try:
-    learner.run()
+    metrics = learner.run(
+        max_updates=FLAGS.max_learner_updates or None)
+    if FLAGS.max_learner_updates:
+      print("Learner completed %d update(s): %s" %
+            (FLAGS.max_learner_updates, metrics))
   finally:
     learner.close()
     env.close()

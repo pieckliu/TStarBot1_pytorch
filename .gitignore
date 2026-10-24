@@ -9,3 +9,7 @@ dist/
 .coverage
 htmlcov/
 .sc2-probe/
+tstarbot1_env/
+tstarbot1_pytorch_env/
+results/
+vendor/
