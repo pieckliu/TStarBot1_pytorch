@@ -35,6 +35,9 @@ flags.DEFINE_boolean("disable_fog", False, "Disable fog-of-war.")
 flags.DEFINE_boolean("use_all_combat_actions", False, "Use all combat actions.")
 flags.DEFINE_boolean("use_region_features", False, "Use region features")
 flags.DEFINE_boolean("use_action_mask", True, "Use action mask or not.")
+flags.DEFINE_boolean("deterministic", False,
+                     "Use argmax actions for PPO evaluation.")
+flags.DEFINE_string("device", "cpu", "PyTorch device for PPO/DQN evaluation.")
 flags.FLAGS(sys.argv)
 
 
@@ -68,26 +71,21 @@ def create_dqn_agent(env):
   assert not FLAGS.use_action_mask
   network = NonspatialDuelingQNet(n_dims=env.observation_space.shape[0],
                                   n_out=env.action_space.n)
-  agent = DQNAgent(network, env.action_space, FLAGS.model_path)
+  agent = DQNAgent(
+      network, env.action_space, FLAGS.model_path, device=FLAGS.device)
   return agent
 
 
 def create_ppo_agent(env):
-  import tensorflow as tf
-  import multiprocessing
   from sc2learner.agents.ppo_policies import LstmPolicy, MlpPolicy
   from sc2learner.agents.ppo_agent import PPOAgent
 
-  ncpu = multiprocessing.cpu_count()
-  if sys.platform == 'darwin': ncpu //= 2
-  config = tf.ConfigProto(allow_soft_placement=True,
-                          intra_op_parallelism_threads=ncpu,
-                          inter_op_parallelism_threads=ncpu)
-  config.gpu_options.allow_growth = True
-  tf.Session(config=config).__enter__()
-
   policy = {'lstm': LstmPolicy, 'mlp': MlpPolicy}[FLAGS.policy]
-  agent = PPOAgent(env=env, policy=policy, model_path=FLAGS.model_path)
+  agent = PPOAgent(env=env,
+                   policy=policy,
+                   model_path=FLAGS.model_path,
+                   device=FLAGS.device,
+                   deterministic=FLAGS.deterministic)
   return agent
 
 

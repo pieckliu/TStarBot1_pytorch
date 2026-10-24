@@ -1,0 +1,26 @@
+# Validated import-only Tencent PySC2 environment on CPython 3.11/Windows.
+# The Tencent source must be checked out at 4f790218 and patched first.
+absl-py==2.5.1
+certifi==2026.10.23
+charset-normalizer==3.5.2
+cloudpickle==3.1.2
+enum34==1.1.10
+future==1.0.0
+gym==0.26.2
+gym-notices==0.1.0
+idna==3.20
+mock==5.2.0
+mpyq==0.2.5
+numpy==2.4.6
+portpicker==1.6.0
+protobuf==3.20.3
+psutil==7.2.2
+pygame==2.6.1
+requests==2.34.2
+s2clientprotocol==4.6.0.67926.0
+scipy==1.17.1
+six==1.17.0
+sk-video==1.1.10
+urllib3==2.8.0
+websocket-client==1.9.2
+whichcraft==0.6.1

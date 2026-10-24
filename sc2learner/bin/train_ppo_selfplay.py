@@ -3,16 +3,13 @@ from __future__ import division
 from __future__ import print_function
 
 import sys
-from threading import Thread
-import os
-import multiprocessing
 import random
 import time
 
 from absl import app
 from absl import flags
 from absl import logging
-import tensorflow as tf
+import torch
 
 from sc2learner.agents.ppo_policies import LstmPolicy, MlpPolicy
 from sc2learner.agents.ppo_agent import PPOActor, PPOLearner, PPOSelfplayActor
@@ -55,6 +52,7 @@ flags.DEFINE_string("init_oppo_pool_filelist", None, "Initial opponent model pat
 flags.DEFINE_string("save_dir", "./checkpoints/", "Dir to save models to")
 flags.DEFINE_integer("save_interval", 50000, "Model saving frequency.")
 flags.DEFINE_integer("print_interval", 1000, "Print train cost frequency.")
+flags.DEFINE_string("device", "auto", "PyTorch device: auto, cpu, cuda, or mps.")
 flags.DEFINE_boolean("disable_fog", False, "Disable fog-of-war.")
 flags.DEFINE_boolean("use_all_combat_actions", False, "Use all combat actions.")
 flags.DEFINE_boolean("use_region_features", False, "Use region features")
@@ -62,15 +60,9 @@ flags.DEFINE_boolean("use_action_mask", True, "Use region-wise combat.")
 flags.FLAGS(sys.argv)
 
 
-def tf_config(ncpu=None):
-  if ncpu is None:
-    ncpu = multiprocessing.cpu_count()
-    if sys.platform == 'darwin': ncpu //= 2
-  config = tf.ConfigProto(allow_soft_placement=True,
-                          intra_op_parallelism_threads=ncpu,
-                          inter_op_parallelism_threads=ncpu)
-  config.gpu_options.allow_growth = True
-  tf.Session(config=config).__enter__()
+def torch_device():
+  if FLAGS.device != 'auto': return FLAGS.device
+  return 'cuda' if torch.cuda.is_available() else 'cpu'
 
 
 def create_env(difficulty, random_seed=None):
@@ -139,7 +131,6 @@ def create_selfplay_env(random_seed=None):
 
 
 def start_actor():
-  tf_config(ncpu=2)
   random.seed(time.time())
   game_seed =  random.randint(0, 2**32 - 1)
   print("Game Seed: %d" % game_seed)
@@ -159,13 +150,15 @@ def start_actor():
       freeze_opponent_pool=False,
       learner_ip=FLAGS.learner_ip,
       port_A=FLAGS.port_A,
-      port_B=FLAGS.port_B)
-  actor.run()
-  env.close()
+      port_B=FLAGS.port_B,
+      device=torch_device())
+  try: actor.run()
+  finally:
+    actor.close()
+    env.close()
 
 
 def start_learner():
-  tf_config()
   env = create_env('1', 0)
   policy = {'lstm': LstmPolicy,
             'mlp': MlpPolicy}[FLAGS.policy]
@@ -185,13 +178,15 @@ def start_learner():
                        save_dir=FLAGS.save_dir,
                        init_model_path=FLAGS.init_model_path,
                        port_A=FLAGS.port_A,
-                       port_B=FLAGS.port_B)
-  learner.run()
-  env.close()
+                       port_B=FLAGS.port_B,
+                       device=torch_device())
+  try: learner.run()
+  finally:
+    learner.close()
+    env.close()
 
 
 def start_evaluator_against_builtin():
-  tf_config(ncpu=2)
   random.seed(time.time())
   difficulty = random.choice(FLAGS.difficulties.split(','))
   game_seed =  random.randint(0, 2**32 - 1)
@@ -207,13 +202,15 @@ def start_evaluator_against_builtin():
                    enable_push=False,
                    learner_ip=FLAGS.learner_ip,
                    port_A=FLAGS.port_A,
-                   port_B=FLAGS.port_B)
-  actor.run()
-  env.close()
+                   port_B=FLAGS.port_B,
+                   device=torch_device())
+  try: actor.run()
+  finally:
+    actor.close()
+    env.close()
 
 
 def start_evaluator_against_model():
-  tf_config(ncpu=2)
   random.seed(time.time())
   game_seed =  random.randint(0, 2**32 - 1)
   print("Game Seed: %d" % game_seed)
@@ -234,9 +231,12 @@ def start_evaluator_against_model():
       freeze_opponent_pool=True,
       learner_ip=FLAGS.learner_ip,
       port_A=FLAGS.port_A,
-      port_B=FLAGS.port_B)
-  actor.run()
-  env.close()
+      port_B=FLAGS.port_B,
+      device=torch_device())
+  try: actor.run()
+  finally:
+    actor.close()
+    env.close()
 
 
 def main(argv):

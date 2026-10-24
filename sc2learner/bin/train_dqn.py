@@ -55,6 +55,7 @@ flags.DEFINE_string("init_model_path", None, "Checkpoint to initialize model.")
 flags.DEFINE_string("checkpoint_dir", "./checkpoints", "Dir to save models to")
 flags.DEFINE_integer("checkpoint_interval", 500000, "Model saving frequency.")
 flags.DEFINE_integer("print_interval", 10000, "Print train cost frequency.")
+flags.DEFINE_string("device", "auto", "PyTorch device: auto, cpu, cuda, or mps.")
 flags.DEFINE_boolean("disable_fog", False, "Disable fog-of-war.")
 flags.DEFINE_boolean("use_all_combat_actions", False, "Use all combat actions.")
 flags.DEFINE_boolean("use_region_features", True, "Use region features")
@@ -85,6 +86,11 @@ def create_network(env):
                                n_out=env.action_space.n)
 
 
+def torch_device():
+  if FLAGS.device != 'auto': return FLAGS.device
+  return 'cuda' if torch.cuda.is_available() else 'cpu'
+
+
 def start_actor_job():
   random.seed(time.time())
   difficulty = random.choice(FLAGS.difficulties.split(','))
@@ -99,9 +105,12 @@ def start_actor_job():
                    discount=FLAGS.discount,
                    send_freq=FLAGS.send_freq,
                    ports=FLAGS.ports.split(','),
-                   learner_ip=FLAGS.learner_ip)
-  actor.run()
-  env.close()
+                   learner_ip=FLAGS.learner_ip,
+                   device=torch_device())
+  try: actor.run()
+  finally:
+    actor.close()
+    env.close()
 
 
 def start_learner_job():
@@ -129,9 +138,10 @@ def start_learner_job():
                        checkpoint_interval=FLAGS.checkpoint_interval,
                        print_interval=FLAGS.print_interval,
                        ports=FLAGS.ports.split(','),
-                       init_model_path=FLAGS.init_model_path)
-  learner.run()
-  env.close()
+                       init_model_path=FLAGS.init_model_path,
+                       device=torch_device())
+  try: learner.run()
+  finally: env.close()
 
 
 def main(argv):

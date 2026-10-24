@@ -31,16 +31,38 @@ A whitepaper of *TStarBots* is available at [here](https://arxiv.org/pdf/1809.07
 ## Installations
 
 ### Prerequisites
-- Python >= 3.5 required.
-- [PySC2 Extension](https://github.com/Tencent/PySC2TencentExtension) required.
+- CPython 3.11 for the validated core environment.
+- PyTorch 2.x; CPU is the correctness baseline and CUDA is optional.
+- The patched [Tencent PySC2 Extension](https://github.com/Tencent/PySC2TencentExtension),
+  StarCraft II 4.6 and AbyssalReef only for real game execution.
 
 ### Setup
-Git clone this repository and then install it with
+Create an isolated environment and install the tested core:
 ```bash
-pip3 install -e sc2learner
+python -m venv .venv
+python -m pip install -e ".[test]" -c requirements/constraints-py311.txt
+python -m pytest -m "not sc2"
 ```
 
+TensorFlow is not required. See [`docs/environment.md`](docs/environment.md)
+for the separate SC2 compatibility procedure.
+
 ## Getting Started
+
+### Run local PyTorch PPO without StarCraft II
+
+The migrated MLP or LSTM PPO core can be trained and evaluated against a synthetic
+macro-action environment on CPU:
+
+```bash
+python -m venv .venv
+python -m pip install -e ".[test]" -c requirements/constraints-py311.txt
+python -m sc2learner.bin.train_ppo_local --updates 10 --device cpu
+```
+
+See [`docs/environment.md`](docs/environment.md) for dependency and SC2 setup,
+and [`docs/ppo_pytorch.md`](docs/ppo_pytorch.md) for PPO behavior and formats.
+Reproducible flags and limitations are in [`docs/baselines.md`](docs/baselines.md).
 
 ### Run Random Agent
 Run a random agent playing against a builtin AI of difficulty level 1.
@@ -62,8 +84,10 @@ done;
 
 - Start a learner worker
 ```bash
-CUDA_VISIBLE_DEVICES=0 python3 -m sc2learner.bin.train_ppo --job_name learner
+CUDA_VISIBLE_DEVICES=0 python3 -m sc2learner.bin.train_ppo --job_name learner --device cuda
 ```
+
+ZeroMQ Python-object serialization is intended only for trusted worker networks.
 
 Similarly, DQN algorithm can be tried with `sc2learner.bin.train_dqn`.
 
@@ -71,7 +95,7 @@ Similarly, DQN algorithm can be tried with `sc2learner.bin.train_dqn`.
 After training, the agent's in-game performance can be observed by letting it play the game against a build-in AI of a certain difficulty level.
 Win-rate is also estimated meanwhile with multiple such games initialized with different game seeds.
 ```bash
-python3 -m sc2learner.bin.evaluate --agent ppo --difficulty 1 --model_path REPLACE_WITH_YOUR_OWN_MODLE_PATH
+python3 -m sc2learner.bin.evaluate --agent ppo --difficulty 1 --model_path checkpoints/ppo.pt --device cpu --deterministic
 ```
 ###
 
@@ -87,7 +111,7 @@ CUDA_VISIBLE_DEVICES= python3 -m pysc2.bin.play_vs_agent --human --map AbyssalRe
 
 - Start a PPO agent
 ```bash
-python3 -m sc2learner.bin.play_vs_ppo_agent --model_path REPLACE_WITH_YOUR_OWN_MODLE_PATH
+python3 -m sc2learner.bin.play_vs_ppo_agent --model_path checkpoints/ppo.pt --device cpu
 ```
 
 ### Train via Self-play

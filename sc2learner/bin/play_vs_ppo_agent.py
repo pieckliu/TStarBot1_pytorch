@@ -4,12 +4,10 @@ from __future__ import print_function
 
 import sys
 import traceback
-import multiprocessing
 
 from absl import app
 from absl import flags
 from absl import logging
-import tensorflow as tf
 
 from sc2learner.envs.lan_raw_env import LanSC2RawEnv
 from sc2learner.envs.observations.zerg_observation_wrappers \
@@ -35,6 +33,8 @@ flags.DEFINE_boolean("use_all_combat_actions", False, "Use all combat actions.")
 flags.DEFINE_boolean("use_region_features", False, "Use region features")
 flags.DEFINE_boolean("use_action_mask", True, "Use action mask or not.")
 flags.DEFINE_enum("policy", 'mlp', ['mlp', 'lstm'], "Job type.")
+flags.DEFINE_string("device", "cpu", "PyTorch inference device.")
+flags.DEFINE_boolean("deterministic", False, "Use argmax PPO actions.")
 
 
 def print_actions(env):
@@ -52,20 +52,8 @@ def print_action_distribution(env, action_counts):
   print("-------------------------------------------------------------------")
 
 
-def tf_config(ncpu=None):
-  if ncpu is None:
-    ncpu = multiprocessing.cpu_count()
-    if sys.platform == 'darwin': ncpu //= 2
-  config = tf.ConfigProto(allow_soft_placement=True,
-                          intra_op_parallelism_threads=ncpu,
-                          inter_op_parallelism_threads=ncpu)
-  config.gpu_options.allow_growth = True
-  tf.Session(config=config).__enter__()
-
-
 def start_lan_agent():
   """Run the agent, connecting to a host started independently."""
-  tf_config()
   env = LanSC2RawEnv(host=FLAGS.host,
                      config_port=FLAGS.config_port,
                      agent_race='zerg',
@@ -86,7 +74,9 @@ def start_lan_agent():
             'mlp': MlpPolicy}[FLAGS.policy]
   agent = PPOAgent(env=env,
                    policy=policy,
-                   model_path=FLAGS.model_path)
+                   model_path=FLAGS.model_path,
+                   device=FLAGS.device,
+                   deterministic=FLAGS.deterministic)
   try:
     action_counts = [0] * env.action_space.n
     observation = env.reset()

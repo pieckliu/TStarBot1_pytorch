@@ -1,602 +1,489 @@
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
+"""PyTorch PPO core and inference agent shared by all execution modes."""
 
-import os
-import time
-from collections import deque
-from queue import Queue
-import queue
-from threading import Thread
-import time
-import random
-import joblib
+from __future__ import annotations
+
+from collections import OrderedDict
+from pathlib import Path
+from typing import Any, Mapping
 
 import numpy as np
-import tensorflow as tf
-import zmq
-from gym import spaces
+import torch
 
-from sc2learner.envs.spaces.mask_discrete import MaskDiscrete
-from sc2learner.agents.utils_tf import explained_variance
-from sc2learner.utils.utils import tprint
+from sc2learner.agents.ppo_policies import LstmPolicy, MlpPolicy
 
 
-class Model(object):
-  def __init__(self, *, policy, ob_space, ac_space, nbatch_act, nbatch_train,
-               unroll_length, ent_coef, vf_coef, max_grad_norm, scope_name,
-               value_clip=False):
-    sess = tf.get_default_session()
-
-    act_model = policy(sess, scope_name, ob_space, ac_space, nbatch_act, 1,
-                       reuse=False)
-    train_model = policy(sess, scope_name, ob_space, ac_space, nbatch_train,
-                         unroll_length, reuse=True)
-
-    A = tf.placeholder(shape=(nbatch_train,), dtype=tf.int32)
-    ADV = tf.placeholder(tf.float32, [None])
-    R = tf.placeholder(tf.float32, [None])
-    OLDNEGLOGPAC = tf.placeholder(tf.float32, [None])
-    OLDVPRED = tf.placeholder(tf.float32, [None])
-    LR = tf.placeholder(tf.float32, [])
-    CLIPRANGE = tf.placeholder(tf.float32, [])
-
-    neglogpac = train_model.pd.neglogp(A)
-    entropy = tf.reduce_mean(train_model.pd.entropy())
-
-    vpred = train_model.vf
-    vpredclipped = OLDVPRED + tf.clip_by_value(train_model.vf - OLDVPRED,
-                                               -CLIPRANGE, CLIPRANGE)
-    vf_losses1 = tf.square(vpred - R)
-    if value_clip:
-      vf_losses2 = tf.square(vpredclipped - R)
-      vf_loss = .5 * tf.reduce_mean(tf.maximum(vf_losses1, vf_losses2))
-    else:
-      vf_loss = .5 * tf.reduce_mean(vf_losses1)
-    ratio = tf.exp(OLDNEGLOGPAC - neglogpac)
-    pg_losses = -ADV * ratio
-    pg_losses2 = -ADV * tf.clip_by_value(ratio, 1.0 - CLIPRANGE,
-                                         1.0 + CLIPRANGE)
-    pg_loss = tf.reduce_mean(tf.maximum(pg_losses, pg_losses2))
-    approxkl = .5 * tf.reduce_mean(tf.square(neglogpac - OLDNEGLOGPAC))
-    clipfrac = tf.reduce_mean(
-        tf.to_float(tf.greater(tf.abs(ratio - 1.0), CLIPRANGE)))
-    loss = pg_loss - entropy * ent_coef + vf_loss * vf_coef
-    params = tf.trainable_variables(scope=scope_name)
-    grads = tf.gradients(loss, params)
-    if max_grad_norm is not None:
-      grads, _grad_norm = tf.clip_by_global_norm(grads, max_grad_norm)
-    grads = list(zip(grads, params))
-    trainer = tf.train.AdamOptimizer(learning_rate=LR, epsilon=1e-5)
-    _train = trainer.apply_gradients(grads)
-    new_params = [tf.placeholder(p.dtype, shape=p.get_shape()) for p in params]
-    param_assign_ops = [p.assign(new_p) for p, new_p in zip(params, new_params)]
-
-    def train(lr, cliprange, obs, returns, dones, actions, values, neglogpacs,
-              states=None):
-      advs = returns - values
-      advs = (advs - advs.mean()) / (advs.std() + 1e-8)
-      if isinstance(ac_space, MaskDiscrete):
-        td_map = {train_model.X:obs[0], train_model.MASK:obs[-1], A:actions,
-                  ADV:advs, R:returns, LR:lr, CLIPRANGE:cliprange,
-                  OLDNEGLOGPAC:neglogpacs, OLDVPRED:values}
-      else:
-        td_map = {train_model.X:obs, A:actions, ADV:advs, R:returns, LR:lr,
-                  CLIPRANGE:cliprange, OLDNEGLOGPAC:neglogpacs, OLDVPRED:values}
-      if states is not None:
-        td_map[train_model.STATE] = states
-        td_map[train_model.DONE] = dones
-      return sess.run(
-        [pg_loss, vf_loss, entropy, approxkl, clipfrac, _train],
-        td_map
-      )[:-1]
-    self.loss_names = ['policy_loss', 'value_loss', 'policy_entropy',
-                       'approxkl', 'clipfrac']
-
-    def save(save_path):
-      joblib.dump(read_params(), save_path)
-
-    def load(load_path):
-      loaded_params = joblib.load(load_path)
-      load_params(loaded_params)
-
-    def read_params():
-      return sess.run(params)
-
-    def load_params(loaded_params):
-      sess.run(param_assign_ops,
-               feed_dict={p : v for p, v in zip(new_params, loaded_params)})
-
-    self.train = train
-    self.train_model = train_model
-    self.act_model = act_model
-    self.step = act_model.step
-    self.value = act_model.value
-    self.initial_state = act_model.initial_state
-    self.save = save
-    self.load = load
-    self.read_params = read_params
-    self.load_params = load_params
-
-    tf.global_variables_initializer().run(session=sess)
+CHECKPOINT_FORMAT_VERSION = 1
 
 
-class PPOActor(object):
-
-  def __init__(self, env, policy, unroll_length, gamma, lam, queue_size=1,
-               enable_push=True, learner_ip="localhost", port_A="5700",
-               port_B="5701"):
-    self._env = env
-    self._unroll_length = unroll_length
-    self._lam = lam
-    self._gamma = gamma
-    self._enable_push = enable_push
-
-    self._model = Model(policy=policy,
-                        scope_name="model",
-                        ob_space=env.observation_space,
-                        ac_space=env.action_space,
-                        nbatch_act=1,
-                        nbatch_train=unroll_length,
-                        unroll_length=unroll_length,
-                        ent_coef=0.01,
-                        vf_coef=0.5,
-                        max_grad_norm=0.5)
-    self._obs = env.reset()
-    self._state = self._model.initial_state
-    self._done = False
-    self._cum_reward = 0
-
-    self._zmq_context = zmq.Context()
-    self._model_requestor = self._zmq_context.socket(zmq.REQ)
-    self._model_requestor.connect("tcp://%s:%s" % (learner_ip, port_A))
-    if enable_push:
-      self._data_queue = Queue(queue_size)
-      self._push_thread = Thread(target=self._push_data, args=(
-          self._zmq_context, learner_ip, port_B, self._data_queue))
-      self._push_thread.start()
-
-  def run(self):
-    while True:
-      # fetch model
-      t = time.time()
-      self._update_model()
-      tprint("Update model time: %f" % (time.time() - t))
-      t = time.time()
-      # rollout
-      unroll = self._nstep_rollout()
-      if self._enable_push:
-        if self._data_queue.full(): tprint("[WARN]: Actor's queue is full.")
-        self._data_queue.put(unroll)
-        tprint("Rollout time: %f" % (time.time() - t))
-
-  def _nstep_rollout(self):
-    mb_obs, mb_rewards, mb_actions, mb_values, mb_dones, mb_neglogpacs = \
-        [],[],[],[],[],[]
-    mb_states, episode_infos = self._state, []
-    for _ in range(self._unroll_length):
-      action, value, self._state, neglogpac = self._model.step(
-          transform_tuple(self._obs, lambda x: np.expand_dims(x, 0)),
-          self._state,
-          np.expand_dims(self._done, 0))
-      mb_obs.append(transform_tuple(self._obs, lambda x: x.copy()))
-      mb_actions.append(action[0])
-      mb_values.append(value[0])
-      mb_neglogpacs.append(neglogpac[0])
-      mb_dones.append(self._done)
-      self._obs, reward, self._done, info = self._env.step(action[0])
-      self._cum_reward += reward
-      if self._done:
-        self._obs = self._env.reset()
-        self._state = self._model.initial_state
-        episode_infos.append({'r': self._cum_reward})
-        self._cum_reward = 0
-      mb_rewards.append(reward)
-    if isinstance(self._obs, tuple):
-      mb_obs = tuple(np.asarray(obs, dtype=self._obs[0].dtype)
-                     for obs in zip(*mb_obs))
-    else:
-      mb_obs = np.asarray(mb_obs, dtype=self._obs.dtype)
-    mb_rewards = np.asarray(mb_rewards, dtype=np.float32)
-    mb_actions = np.asarray(mb_actions)
-    mb_values = np.asarray(mb_values, dtype=np.float32)
-    mb_neglogpacs = np.asarray(mb_neglogpacs, dtype=np.float32)
-    mb_dones = np.asarray(mb_dones, dtype=np.bool)
-    last_values = self._model.value(
-        transform_tuple(self._obs, lambda x: np.expand_dims(x, 0)),
-        self._state,
-        np.expand_dims(self._done, 0))
-    mb_returns = np.zeros_like(mb_rewards)
-    mb_advs = np.zeros_like(mb_rewards)
-    last_gae_lam = 0
-    for t in reversed(range(self._unroll_length)):
-      if t == self._unroll_length - 1:
-        next_nonterminal = 1.0 - self._done
-        next_values = last_values[0]
-      else:
-        next_nonterminal = 1.0 - mb_dones[t + 1]
-        next_values = mb_values[t + 1]
-      delta = mb_rewards[t] + self._gamma * next_values * next_nonterminal - \
-          mb_values[t]
-      mb_advs[t] = last_gae_lam = delta + self._gamma * self._lam * \
-          next_nonterminal * last_gae_lam
-    mb_returns = mb_advs + mb_values
-    return (mb_obs, mb_returns, mb_dones, mb_actions, mb_values, mb_neglogpacs,
-            mb_states, episode_infos)
-
-  def _push_data(self, zmq_context, learner_ip, port_B, data_queue):
-    sender = zmq_context.socket(zmq.PUSH)
-    sender.setsockopt(zmq.SNDHWM, 1)
-    sender.setsockopt(zmq.RCVHWM, 1)
-    sender.connect("tcp://%s:%s" % (learner_ip, port_B))
-    while True:
-      data = data_queue.get()
-      sender.send_pyobj(data)
-
-  def _update_model(self):
-      self._model_requestor.send_string("request model")
-      self._model.load_params(self._model_requestor.recv_pyobj())
-
-
-class PPOLearner(object):
-
-  def __init__(self, env, policy, unroll_length, lr, clip_range, batch_size,
-               ent_coef=0.01, vf_coef=0.5, max_grad_norm=0.5, queue_size=8,
-               print_interval=100, save_interval=10000, learn_act_speed_ratio=0,
-               unroll_split=8, save_dir=None, init_model_path=None,
-               port_A="5700", port_B="5701"):
-    assert isinstance(env.action_space, spaces.Discrete)
-    if isinstance(lr, float): lr = constfn(lr)
-    else: assert callable(lr)
-    if isinstance(clip_range, float): clip_range = constfn(clip_range)
-    else: assert callable(clip_range)
-    self._lr = lr
-    self._clip_range=clip_range
-    self._batch_size = batch_size
-    self._unroll_length = unroll_length
-    self._print_interval = print_interval
-    self._save_interval = save_interval
-    self._learn_act_speed_ratio = learn_act_speed_ratio
-    self._save_dir = save_dir
-
-    self._model = Model(policy=policy,
-                        scope_name="model",
-                        ob_space=env.observation_space,
-                        ac_space=env.action_space,
-                        nbatch_act=1,
-                        nbatch_train=batch_size * unroll_length,
-                        unroll_length=unroll_length,
-                        ent_coef=ent_coef,
-                        vf_coef=vf_coef,
-                        max_grad_norm=max_grad_norm)
-    if init_model_path is not None: self._model.load(init_model_path)
-    self._model_params = self._model.read_params()
-    self._unroll_split = unroll_split if self._model.initial_state is None else 1
-    assert self._unroll_length % self._unroll_split == 0
-    self._data_queue = deque(maxlen=queue_size * self._unroll_split)
-    self._data_timesteps = deque(maxlen=200)
-    self._episode_infos = deque(maxlen=5000)
-    self._num_unrolls = 0
-
-    self._zmq_context = zmq.Context()
-    self._pull_data_thread = Thread(
-        target=self._pull_data,
-        args=(self._zmq_context, self._data_queue, self._episode_infos,
-              self._unroll_split, port_B)
+def _feature_space(observation_space: Any, action_dim: int):
+    spaces = getattr(observation_space, "spaces", None)
+    if spaces is None:
+        return observation_space, False
+    spaces = tuple(spaces)
+    if len(spaces) == 2 and tuple(spaces[-1].shape) == (action_dim,):
+        return spaces[0], True
+    raise ValueError(
+        "MLP PPO supports a single feature array or (features, action_mask); "
+        "spatial tuple observations are not part of Milestones 2-3"
     )
-    self._pull_data_thread.start()
-    self._reply_model_thread = Thread(
-        target=self._reply_model, args=(self._zmq_context, port_A))
-    self._reply_model_thread.start()
 
-  def run(self):
-    #while len(self._data_queue) < self._data_queue.maxlen: time.sleep(1)
-    while len(self._episode_infos) < self._episode_infos.maxlen / 2:
-      time.sleep(1)
 
-    batch_queue = Queue(4)
-    batch_threads = [
-        Thread(target=self._prepare_batch,
-               args=(self._data_queue, batch_queue,
-                     self._batch_size * self._unroll_split))
-        for _ in range(8)
+def _stack_observations(observations):
+    if isinstance(observations[0], tuple):
+        return tuple(np.stack(parts) for parts in zip(*observations))
+    return np.stack(observations)
+
+
+def compute_gae(
+    rewards,
+    values,
+    next_values,
+    terminated,
+    truncated,
+    gamma: float,
+    gae_lambda: float,
+):
+    """Compute GAE without leaking traces across episode boundaries.
+
+    True terminals suppress value bootstrapping. Time-limit truncations may
+    bootstrap from their final observation, but both boundary types stop the
+    recursive GAE trace before a reset observation.
+    """
+    rewards = np.asarray(rewards, dtype=np.float32)
+    values = np.asarray(values, dtype=np.float32)
+    next_values = np.asarray(next_values, dtype=np.float32)
+    terminated = np.asarray(terminated, dtype=np.bool_)
+    truncated = np.asarray(truncated, dtype=np.bool_)
+    expected_shape = rewards.shape
+    for name, array in (
+        ("values", values),
+        ("next_values", next_values),
+        ("terminated", terminated),
+        ("truncated", truncated),
+    ):
+        if array.shape != expected_shape:
+            raise ValueError(f"{name} shape {array.shape} != rewards shape {expected_shape}")
+    advantages = np.zeros_like(rewards)
+    next_advantage = 0.0
+    for index in range(len(rewards) - 1, -1, -1):
+        bootstrap = 0.0 if terminated[index] else 1.0
+        continuation = 0.0 if terminated[index] or truncated[index] else 1.0
+        delta = rewards[index] + gamma * next_values[index] * bootstrap - values[index]
+        next_advantage = delta + gamma * gae_lambda * continuation * next_advantage
+        advantages[index] = next_advantage
+    return advantages, advantages + values
+
+
+def ppo_loss(
+    policy,
+    observations: torch.Tensor,
+    actions: torch.Tensor,
+    returns: torch.Tensor,
+    old_values: torch.Tensor,
+    old_negative_log_probabilities: torch.Tensor,
+    *,
+    action_mask: torch.Tensor | None,
+    clip_range: float,
+    entropy_coefficient: float,
+    value_coefficient: float,
+    value_clip: bool,
+    states: torch.Tensor | None = None,
+    episode_starts: torch.Tensor | None = None,
+):
+    if getattr(policy, "is_recurrent", False):
+        if states is None:
+            raise ValueError("recurrent PPO updates require initial states")
+        values, negative_log_probabilities, entropy_values, _, _ = policy.evaluate_actions(
+            observations, actions, states, episode_starts, action_mask
+        )
+    else:
+        values, negative_log_probabilities, entropy_values, _ = policy.evaluate_actions(
+            observations, actions, action_mask
+        )
+    advantages = returns - old_values
+    advantages = (advantages - advantages.mean()) / (
+        advantages.std(unbiased=False) + 1e-8
+    )
+    ratio = torch.exp(old_negative_log_probabilities - negative_log_probabilities)
+    policy_losses = -advantages * ratio
+    clipped_policy_losses = -advantages * torch.clamp(
+        ratio, 1.0 - clip_range, 1.0 + clip_range
+    )
+    policy_loss_value = torch.maximum(policy_losses, clipped_policy_losses).mean()
+
+    value_losses = (values - returns).square()
+    if value_clip:
+        clipped_values = old_values + torch.clamp(
+            values - old_values, -clip_range, clip_range
+        )
+        clipped_value_losses = (clipped_values - returns).square()
+        value_loss_value = 0.5 * torch.maximum(
+            value_losses, clipped_value_losses
+        ).mean()
+    else:
+        value_loss_value = 0.5 * value_losses.mean()
+
+    entropy = entropy_values.mean()
+    approximate_kl = 0.5 * (
+        negative_log_probabilities - old_negative_log_probabilities
+    ).square().mean()
+    clip_fraction = ((ratio - 1.0).abs() > clip_range).float().mean()
+    total_loss = (
+        policy_loss_value
+        - entropy_coefficient * entropy
+        + value_coefficient * value_loss_value
+    )
+    return {
+        "total_loss": total_loss,
+        "policy_loss": policy_loss_value,
+        "value_loss": value_loss_value,
+        "entropy": entropy,
+        "approx_kl": approximate_kl,
+        "clip_fraction": clip_fraction,
+        "ratio": ratio,
+        "advantages": advantages,
+    }
+
+
+class Model:
+    """PyTorch PPO model shared by MLP and recurrent execution."""
+
+    loss_names = [
+        "policy_loss",
+        "value_loss",
+        "policy_entropy",
+        "approxkl",
+        "clipfrac",
     ]
-    for thread in batch_threads:
-      thread.start()
 
-    updates, loss = 0, []
-    time_start = time.time()
-    while True:
-      while (self._learn_act_speed_ratio > 0 and
-          updates * self._batch_size >= \
-          self._num_unrolls * self._learn_act_speed_ratio):
-        time.sleep(0.001)
-      updates += 1
-      lr_now = self._lr(updates)
-      clip_range_now = self._clip_range(updates)
+    def __init__(
+        self,
+        *,
+        policy=MlpPolicy,
+        ob_space,
+        ac_space,
+        nbatch_act=None,
+        nbatch_train=None,
+        unroll_length=1,
+        ent_coef=0.01,
+        vf_coef=0.5,
+        max_grad_norm=0.5,
+        scope_name="model",
+        value_clip=False,
+        learning_rate=1e-5,
+        device="cpu",
+    ):
+        del nbatch_train, unroll_length, scope_name
+        if not isinstance(policy, type) or not issubclass(policy, (MlpPolicy, LstmPolicy)):
+            raise TypeError("policy must be MlpPolicy or LstmPolicy")
+        self.action_dim = int(ac_space.n)
+        feature_space, self.masked = _feature_space(ob_space, self.action_dim)
+        self.observation_shape = tuple(feature_space.shape)
+        self.observation_dim = int(np.prod(self.observation_shape))
+        self.device = torch.device(device)
+        self.entropy_coefficient = float(ent_coef)
+        self.value_coefficient = float(vf_coef)
+        self.max_grad_norm = max_grad_norm
+        self.value_clip = bool(value_clip)
+        self.policy = policy(self.observation_dim, self.action_dim).to(self.device)
+        self.is_recurrent = self.policy.is_recurrent
+        self.optimizer = torch.optim.Adam(
+            self.policy.parameters(), lr=learning_rate, eps=1e-5
+        )
+        self.initial_state = (
+            self.policy.initial_state(int(nbatch_act or 1), self.device).cpu().numpy()
+            if self.is_recurrent else None
+        )
+        self.last_train_metrics = None
 
-      batch = batch_queue.get()
-      obs, returns, dones, actions, values, neglogpacs, states = batch
-      loss.append(self._model.train(lr_now, clip_range_now, obs, returns, dones,
-                                    actions, values, neglogpacs, states))
-      self._model_params = self._model.read_params()
+    def _tensor_observation(self, observation, *, require_batch=False):
+        action_mask = None
+        features = observation
+        if isinstance(observation, tuple):
+            if len(observation) != 2:
+                raise ValueError("MLP masked observations must be (features, action_mask)")
+            features, action_mask = observation
+        features = torch.as_tensor(features, dtype=torch.float32, device=self.device)
+        if features.ndim == len(self.observation_shape):
+            features = features.unsqueeze(0)
+        if require_batch and features.ndim != len(self.observation_shape) + 1:
+            raise ValueError("training observations must contain one batch dimension")
+        if action_mask is not None:
+            action_mask = torch.as_tensor(
+                action_mask, dtype=torch.float32, device=self.device
+            )
+            if action_mask.ndim == 1:
+                action_mask = action_mask.unsqueeze(0)
+        elif self.masked:
+            raise ValueError("this model requires an action mask")
+        return features, action_mask
 
-      if updates % self._print_interval == 0:
-        loss_mean = np.mean(loss, axis=0)
-        batch_steps = self._batch_size * self._unroll_length
-        time_elapsed = time.time() - time_start
-        train_fps = self._print_interval * batch_steps / time_elapsed
-        rollout_fps = len(self._data_timesteps) * self._unroll_length  / \
-            (time.time() - self._data_timesteps[0])
-        var = explained_variance(values, returns)
-        avg_reward = safemean([info['r'] for info in self._episode_infos])
-        tprint("Update: %d	Train-fps: %.1f	Rollout-fps: %.1f	"
-               "Explained-var: %.5f	Avg-reward %.2f	Policy-loss: %.5f	"
-               "Value-loss: %.5f	Policy-entropy: %.5f	Approx-KL: %.5f	"
-               "Clip-frac: %.3f	Time: %.1f" % (updates, train_fps, rollout_fps,
-               var, avg_reward, *loss_mean[:5], time_elapsed))
-        time_start, loss = time.time(), []
+    def step(self, observation, state=None, done=None, deterministic=False):
+        self.policy.eval()
+        features, action_mask = self._tensor_observation(observation)
+        with torch.no_grad():
+            if self.is_recurrent:
+                if state is None:
+                    state = self.policy.initial_state(features.shape[0], self.device)
+                else:
+                    state = torch.as_tensor(state, dtype=torch.float32, device=self.device)
+                starts = torch.as_tensor(
+                    np.zeros(features.shape[0], dtype=np.bool_) if done is None else done,
+                    dtype=torch.bool, device=self.device,
+                ).reshape(-1)
+                actions, values, negative_log_probabilities, next_state = self.policy.act(
+                    features, state, starts, action_mask, deterministic=deterministic
+                )
+            else:
+                actions, values, negative_log_probabilities = self.policy.act(
+                    features, action_mask, deterministic=deterministic
+                )
+                next_state = None
+        return (
+            actions.cpu().numpy(),
+            values.cpu().numpy(),
+            None if next_state is None else next_state.cpu().numpy(),
+            negative_log_probabilities.cpu().numpy(),
+        )
 
-      if self._save_dir is not None and updates % self._save_interval == 0:
-        os.makedirs(self._save_dir, exist_ok=True)
-        save_path = os.path.join(self._save_dir, 'checkpoint-%d' % updates)
-        self._model.save(save_path)
-        tprint('Saved to %s.' % save_path)
+    def value(self, observation, state=None, done=None):
+        self.policy.eval()
+        features, _ = self._tensor_observation(observation)
+        with torch.no_grad():
+            if self.is_recurrent:
+                if state is None:
+                    state = self.policy.initial_state(features.shape[0], self.device)
+                else:
+                    state = torch.as_tensor(state, dtype=torch.float32, device=self.device)
+                starts = torch.as_tensor(
+                    np.zeros(features.shape[0], dtype=np.bool_) if done is None else done,
+                    dtype=torch.bool, device=self.device,
+                ).reshape(-1)
+                values = self.policy.forward_sequence(features, state, starts)[0].value
+            else:
+                values = self.policy(features).value
+        return values.cpu().numpy()
 
-  def _prepare_batch(self, data_queue, batch_queue, batch_size):
-    while True:
-      batch = random.sample(data_queue, batch_size)
-      obs, returns, dones, actions, values, neglogpacs, states = zip(*batch)
-      if isinstance(obs[0], tuple):
-        obs = tuple(np.concatenate(ob) for ob in zip(*obs))
-      else:
-        obs = np.concatenate(obs)
-      returns = np.concatenate(returns)
-      dones = np.concatenate(dones)
-      actions = np.concatenate(actions)
-      values = np.concatenate(values)
-      neglogpacs = np.concatenate(neglogpacs)
-      states = np.concatenate(states) if states[0] is not None else None
-      batch_queue.put((obs, returns, dones, actions, values, neglogpacs, states))
+    def update(
+        self,
+        learning_rate,
+        clip_range,
+        observations,
+        returns,
+        actions,
+        old_values,
+        old_negative_log_probabilities,
+        dones=None,
+        states=None,
+    ):
+        self.policy.train()
+        features, action_mask = self._tensor_observation(
+            observations, require_batch=True
+        )
+        returns = torch.as_tensor(returns, dtype=torch.float32, device=self.device)
+        actions = torch.as_tensor(actions, dtype=torch.long, device=self.device)
+        old_values = torch.as_tensor(
+            old_values, dtype=torch.float32, device=self.device
+        )
+        old_negative_log_probabilities = torch.as_tensor(
+            old_negative_log_probabilities, dtype=torch.float32, device=self.device
+        )
+        recurrent_states = None if states is None else torch.as_tensor(
+            states, dtype=torch.float32, device=self.device
+        )
+        episode_starts = None if dones is None else torch.as_tensor(
+            dones, dtype=torch.bool, device=self.device
+        )
+        for parameter_group in self.optimizer.param_groups:
+            parameter_group["lr"] = float(learning_rate)
+        losses = ppo_loss(
+            self.policy,
+            features,
+            actions,
+            returns,
+            old_values,
+            old_negative_log_probabilities,
+            action_mask=action_mask,
+            clip_range=float(clip_range),
+            entropy_coefficient=self.entropy_coefficient,
+            value_coefficient=self.value_coefficient,
+            value_clip=self.value_clip,
+            states=recurrent_states,
+            episode_starts=episode_starts,
+        )
+        self.optimizer.zero_grad(set_to_none=True)
+        losses["total_loss"].backward()
+        if self.max_grad_norm is None:
+            squared_norm = sum(
+                parameter.grad.detach().square().sum()
+                for parameter in self.policy.parameters()
+                if parameter.grad is not None
+            )
+            gradient_norm = squared_norm.sqrt()
+        else:
+            gradient_norm = torch.nn.utils.clip_grad_norm_(
+                self.policy.parameters(), self.max_grad_norm
+            )
+        self.optimizer.step()
+        metrics = {
+            name: float(value.detach().cpu())
+            for name, value in losses.items()
+            if name not in {"ratio", "advantages"}
+        }
+        metrics["gradient_norm"] = float(gradient_norm.detach().cpu())
+        self.last_train_metrics = metrics
+        return metrics
 
-  def _pull_data(self, zmq_context, data_queue, episode_infos, unroll_split,
-                 port_B):
-    receiver = zmq_context.socket(zmq.PULL)
-    receiver.setsockopt(zmq.RCVHWM, 1)
-    receiver.setsockopt(zmq.SNDHWM, 1)
-    receiver.bind("tcp://*:%s" % port_B)
-    while True:
-      data = receiver.recv_pyobj()
-      if unroll_split > 1:
-        data_queue.extend(list(zip(*(
-            [list(zip(*transform_tuple(
-                data[0], lambda x: np.split(x, unroll_split))))] + \
-                [np.split(arr, unroll_split) for arr in data[1:-2]] + \
-                [[data[-2] for _ in range(unroll_split)]]
-        ))))
-      else:
-        data_queue.append(data[:-1])
-      episode_infos.extend(data[-1])
-      self._data_timesteps.append(time.time())
-      self._num_unrolls += 1
+    def train(
+        self,
+        lr,
+        cliprange,
+        obs,
+        returns,
+        dones,
+        actions,
+        values,
+        neglogpacs,
+        states=None,
+    ):
+        metrics = self.update(
+            lr, cliprange, obs, returns, actions, values, neglogpacs, dones, states
+        )
+        return [
+            metrics["policy_loss"],
+            metrics["value_loss"],
+            metrics["entropy"],
+            metrics["approx_kl"],
+            metrics["clip_fraction"],
+        ]
 
-  def _reply_model(self, zmq_context, port_A):
-    receiver = zmq_context.socket(zmq.REP)
-    receiver.bind("tcp://*:%s" % port_A)
-    while True:
-      msg = receiver.recv_string()
-      assert msg == "request model"
-      receiver.send_pyobj(self._model_params)
+    def read_params(self):
+        return OrderedDict(
+            (name, value.detach().cpu().clone())
+            for name, value in self.policy.state_dict().items()
+        )
 
+    def load_params(self, loaded_params: Mapping[str, Any]):
+        if not isinstance(loaded_params, Mapping):
+            raise TypeError("PyTorch parameter snapshots must be named mappings")
+        converted = OrderedDict(
+            (name, torch.as_tensor(value, device=self.device))
+            for name, value in loaded_params.items()
+        )
+        self.policy.load_state_dict(converted, strict=True)
 
-class PPOAgent(object):
+    def save(self, save_path):
+        checkpoint = {
+            "format_version": CHECKPOINT_FORMAT_VERSION,
+            "policy_class": type(self.policy).__name__,
+            "observation_shape": self.observation_shape,
+            "action_dim": self.action_dim,
+            "masked": self.masked,
+            "value_clip": self.value_clip,
+            "model_state_dict": self.policy.state_dict(),
+            "optimizer_state_dict": self.optimizer.state_dict(),
+        }
+        torch.save(checkpoint, Path(save_path))
 
-  def __init__(self, env, policy, model_path=None):
-    assert isinstance(env.action_space, spaces.Discrete)
-    self._model = Model(policy=policy,
-                        scope_name="model",
-                        ob_space=env.observation_space,
-                        ac_space=env.action_space,
-                        nbatch_act=1,
-                        nbatch_train=1,
-                        unroll_length=1,
-                        ent_coef=0.01,
-                        vf_coef=0.5,
-                        max_grad_norm=0.5)
-    if model_path is not None:
-      self._model.load(model_path)
-    self._state = self._model.initial_state
-    self._done = False
-
-  def act(self, observation):
-      action, value, self._state, _ = self._model.step(
-          transform_tuple(observation, lambda x: np.expand_dims(x, 0)),
-          self._state,
-          np.expand_dims(self._done, 0))
-      return action[0]
-
-  def reset(self):
-    self._state = self._model.initial_state
-
-
-class PPOSelfplayActor(object):
-
-  def __init__(self, env, policy, unroll_length, gamma, lam, model_cache_size,
-               model_cache_prob, queue_size=1, prob_latest_opponent=0.0,
-               init_opponent_pool_filelist=None, freeze_opponent_pool=False,
-               enable_push=True, learner_ip="localhost", port_A="5700",
-               port_B="5701"):
-    assert isinstance(env.action_space, spaces.Discrete)
-    self._env = env
-    self._unroll_length = unroll_length
-    self._lam = lam
-    self._gamma = gamma
-    self._prob_latest_opponent = prob_latest_opponent
-    self._freeze_opponent_pool = freeze_opponent_pool
-    self._enable_push = enable_push
-    self._model_cache_prob = model_cache_prob
-
-    self._model = Model(policy=policy,
-                        scope_name="model",
-                        ob_space=env.observation_space,
-                        ac_space=env.action_space,
-                        nbatch_act=1,
-                        nbatch_train=unroll_length,
-                        unroll_length=unroll_length,
-                        ent_coef=0.01,
-                        vf_coef=0.5,
-                        max_grad_norm=0.5)
-    self._oppo_model = Model(policy=policy,
-                             scope_name="oppo_model",
-                             ob_space=env.observation_space,
-                             ac_space=env.action_space,
-                             nbatch_act=1,
-                             nbatch_train=unroll_length,
-                             unroll_length=unroll_length,
-                             ent_coef=0.01,
-                             vf_coef=0.5,
-                             max_grad_norm=0.5)
-    self._obs, self._oppo_obs = env.reset()
-    self._state = self._model.initial_state
-    self._oppo_state = self._oppo_model.initial_state
-    self._done = False
-    self._cum_reward = 0
-
-    self._model_cache = deque(maxlen=model_cache_size)
-    if init_opponent_pool_filelist is not None:
-      with open(init_opponent_pool_filelist, 'r') as f:
-        for model_path in f.readlines():
-          print(model_path)
-          self._model_cache.append(joblib.load(model_path.strip()))
-    self._latest_model = self._oppo_model.read_params()
-    if len(self._model_cache) == 0:
-      self._model_cache.append(self._latest_model)
-    self._update_opponent()
-
-    self._zmq_context = zmq.Context()
-    self._model_requestor = self._zmq_context.socket(zmq.REQ)
-    self._model_requestor.connect("tcp://%s:%s" % (learner_ip, port_A))
-    if enable_push:
-      self._data_queue = Queue(queue_size)
-      self._push_thread = Thread(target=self._push_data, args=(
-          self._zmq_context, learner_ip, port_B, self._data_queue))
-      self._push_thread.start()
-
-  def run(self):
-    while True:
-      t = time.time()
-      self._update_model()
-      tprint("Time update model: %f" % (time.time() - t))
-      t = time.time()
-      unroll = self._nstep_rollout()
-      if self._enable_push:
-        if self._data_queue.full(): tprint("[WARN]: Actor's queue is full.")
-        self._data_queue.put(unroll)
-        tprint("Time rollout: %f" % (time.time() - t))
-
-  def _nstep_rollout(self):
-    mb_obs, mb_rewards, mb_actions, mb_values, mb_dones, mb_neglogpacs = \
-        [],[],[],[],[],[]
-    mb_states, episode_infos = self._state, []
-    for _ in range(self._unroll_length):
-      action, value, self._state, neglogpac = self._model.step(
-          transform_tuple(self._obs, lambda x: np.expand_dims(x, 0)),
-          self._state,
-          np.expand_dims(self._done, 0))
-      oppo_action, _, self._oppo_state, _ = self._oppo_model.step(
-          transform_tuple(self._oppo_obs, lambda x: np.expand_dims(x, 0)),
-          self._oppo_state,
-          np.expand_dims(self._done, 0))
-      mb_obs.append(transform_tuple(self._obs, lambda x: x.copy()))
-      mb_actions.append(action[0])
-      mb_values.append(value[0])
-      mb_neglogpacs.append(neglogpac[0])
-      mb_dones.append(self._done)
-      (self._obs, self._oppo_obs), reward, self._done, info = self._env.step(
-        [action[0], oppo_action[0]])
-      self._cum_reward += reward
-      if self._done:
-        self._obs, self._oppo_obs = self._env.reset()
-        self._state = self._model.initial_state
-        self._oppo_state = self._oppo_model.initial_state
-        self._update_opponent()
-        episode_infos.append({'r': self._cum_reward})
-        self._cum_reward = 0
-      mb_rewards.append(reward)
-    if isinstance(self._obs, tuple):
-      mb_obs = tuple(np.asarray(obs, dtype=self._obs[0].dtype)
-                     for obs in zip(*mb_obs))
-    else:
-      mb_obs = np.asarray(mb_obs, dtype=self._obs.dtype)
-    mb_rewards = np.asarray(mb_rewards, dtype=np.float32)
-    mb_actions = np.asarray(mb_actions)
-    mb_values = np.asarray(mb_values, dtype=np.float32)
-    mb_neglogpacs = np.asarray(mb_neglogpacs, dtype=np.float32)
-    mb_dones = np.asarray(mb_dones, dtype=np.bool)
-    last_values = self._model.value(
-        transform_tuple(self._obs, lambda x: np.expand_dims(x, 0)),
-        self._state,
-        np.expand_dims(self._done, 0))
-    mb_returns = np.zeros_like(mb_rewards)
-    mb_advs = np.zeros_like(mb_rewards)
-    last_gae_lam = 0
-    for t in reversed(range(self._unroll_length)):
-      if t == self._unroll_length - 1:
-        next_nonterminal = 1.0 - self._done
-        next_values = last_values[0]
-      else:
-        next_nonterminal = 1.0 - mb_dones[t + 1]
-        next_values = mb_values[t + 1]
-      delta = mb_rewards[t] + self._gamma * next_values * next_nonterminal - \
-          mb_values[t]
-      mb_advs[t] = last_gae_lam = delta + self._gamma * self._lam * \
-          next_nonterminal * last_gae_lam
-    mb_returns = mb_advs + mb_values
-    return (mb_obs, mb_returns, mb_dones, mb_actions, mb_values, mb_neglogpacs,
-            mb_states, episode_infos)
-
-  def _push_data(self, zmq_context, learner_ip, port_B, data_queue):
-    sender = zmq_context.socket(zmq.PUSH)
-    sender.setsockopt(zmq.SNDHWM, 1)
-    sender.setsockopt(zmq.RCVHWM, 1)
-    sender.connect("tcp://%s:%s" % (learner_ip, port_B))
-    while True:
-      data = data_queue.get()
-      sender.send_pyobj(data)
-
-  def _update_model(self):
-      self._model_requestor.send_string("request model")
-      model_params = self._model_requestor.recv_pyobj()
-      self._model.load_params(model_params)
-      if (not self._freeze_opponent_pool and
-          random.uniform(0, 1.0) < self._model_cache_prob):
-        self._model_cache.append(model_params)
-      self._latest_model = model_params
-
-  def _update_opponent(self):
-    if (random.uniform(0, 1.0) < self._prob_latest_opponent or
-        len(self._model_cache) == 0):
-      self._oppo_model.load_params(self._latest_model)
-      tprint("Opponent updated with the current model.")
-    else:
-      model_params = random.choice(self._model_cache)
-      self._oppo_model.load_params(model_params)
-      tprint("Opponent updated with the previous model. %d models cached." %
-          len(self._model_cache))
+    def load(self, load_path, *, load_optimizer=False):
+        checkpoint = torch.load(
+            Path(load_path), map_location=self.device, weights_only=False
+        )
+        if checkpoint.get("format_version") != CHECKPOINT_FORMAT_VERSION:
+            raise ValueError("unsupported PPO checkpoint format")
+        if checkpoint.get("policy_class") != type(self.policy).__name__:
+            raise ValueError("checkpoint policy class does not match the model")
+        expected = (
+            self.observation_shape,
+            self.action_dim,
+            self.masked,
+            self.value_clip,
+        )
+        actual = (
+            tuple(checkpoint["observation_shape"]),
+            int(checkpoint["action_dim"]),
+            bool(checkpoint["masked"]),
+            bool(checkpoint["value_clip"]),
+        )
+        if actual != expected:
+            raise ValueError(f"checkpoint schema {actual} does not match model {expected}")
+        self.policy.load_state_dict(checkpoint["model_state_dict"], strict=True)
+        if load_optimizer:
+            self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
 
 
-def constfn(val):
-  def f(_):
-    return val
-  return f
+class PPOAgent:
+    def __init__(
+        self,
+        env,
+        policy=MlpPolicy,
+        model_path=None,
+        *,
+        device="cpu",
+        deterministic=False,
+    ):
+        self._model = Model(
+            policy=policy,
+            ob_space=env.observation_space,
+            ac_space=env.action_space,
+            ent_coef=0.01,
+            vf_coef=0.5,
+            max_grad_norm=0.5,
+            device=device,
+        )
+        if model_path is not None:
+            self._model.load(model_path)
+        self._deterministic = deterministic
+        self.reset()
+
+    def act(self, observation):
+        action, _, self._state, _ = self._model.step(
+            observation, self._state, self._episode_start,
+            deterministic=self._deterministic
+        )
+        self._episode_start = np.asarray([False])
+        return int(action[0])
+
+    def reset(self):
+        self._state = None
+        self._episode_start = np.asarray([True])
 
 
-def safemean(xs):
-  return np.nan if len(xs) == 0 else np.mean(xs)
+class PPOActor:
+    """Compatibility constructor for the ZeroMQ actor implementation."""
+
+    def __new__(cls, *args, **kwargs):
+        from sc2learner.agents.ppo_distributed import PPOActor as Implementation
+        return Implementation(*args, **kwargs)
 
 
-def transform_tuple(x, transformer):
-  if isinstance(x, tuple):
-    return tuple(transformer(a) for a in x)
-  else:
-    return transformer(x)
+class PPOLearner:
+    """Compatibility constructor for the ZeroMQ learner implementation."""
+
+    def __new__(cls, *args, **kwargs):
+        from sc2learner.agents.ppo_distributed import PPOLearner as Implementation
+        return Implementation(*args, **kwargs)
+
+
+class PPOSelfplayActor:
+    """Compatibility constructor for the PyTorch self-play actor."""
+
+    def __new__(cls, *args, **kwargs):
+        from sc2learner.agents.ppo_distributed import (
+            PPOSelfplayActor as Implementation,
+        )
+        return Implementation(*args, **kwargs)
+
+
+def constfn(value):
+    return lambda _: value
+
+
+def safemean(values):
+    return np.nan if len(values) == 0 else np.mean(values)
+
+
+def transform_tuple(value, transformer):
+    if isinstance(value, tuple):
+        return tuple(transformer(part) for part in value)
+    return transformer(value)

@@ -1,0 +1,17 @@
+diff --git a/pysc2/lib/colors.py b/pysc2/lib/colors.py
+index 94a17d7..42cc47a 100644
+--- a/pysc2/lib/colors.py
++++ b/pysc2/lib/colors.py
+@@ -123,7 +123,11 @@ def smooth_hue_palette(scale):
+ 
+ def shuffled_hue(scale):
+   palette = list(smooth_hue_palette(scale))
+-  random.shuffle(palette, lambda: 0.5)  # Return a fixed shuffle
++  # Python 3.11 removed random.shuffle's custom RNG argument. Reproduce the
++  # old constant-0.5 Fisher-Yates shuffle exactly to preserve palette values.
++  for i in range(len(palette) - 1, 0, -1):
++    j = int(0.5 * (i + 1))
++    palette[i], palette[j] = palette[j], palette[i]
+   return numpy.array(palette)
+ 
+ 

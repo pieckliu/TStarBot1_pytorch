@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=80,<81"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sc2learner"
+version = "0.2.0.dev0"
+description = "Macro-action-based StarCraft II reinforcement learning environment"
+readme = "README.md"
+requires-python = ">=3.11,<3.12"
+license = "Apache-2.0"
+authors = [{ name = "Tencent AI Lab" }]
+dependencies = [
+  "absl-py>=2.3,<3",
+  "gymnasium>=1.4,<1.5",
+  "numpy>=2.4,<2.5",
+  "pyzmq>=27.2,<28",
+  "torch>=2.14,<2.15",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=9.1,<9.2"]
+sc2 = [
+  "gym==0.26.2",
+  "protobuf==3.20.3",
+  "s2clientprotocol==4.6.0.67926.0",
+]
+
+[project.urls]
+Repository = "https://github.com/pieckliu/TStarBot1_pytorch"
+
+[tool.setuptools.packages.find]
+include = ["sc2learner*"]
+
+[tool.pytest.ini_options]
+addopts = "-ra --strict-markers"
+testpaths = ["tests"]
+markers = [
+  "sc2: requires the Tencent PySC2 extension, StarCraft II assets, and maps",
+]

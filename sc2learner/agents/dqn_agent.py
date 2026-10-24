@@ -3,58 +3,69 @@ from __future__ import division
 from __future__ import print_function
 
 import os
-import sys
 import time
-import struct
 import random
-import math
 from copy import deepcopy
 import queue
 from threading import Thread
-from collections import deque
-import io
 import zmq
 
 import numpy as np
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
-from torch.autograd import Variable
 import torch.optim as optim
-from gym.spaces import prng
-from gym.spaces.discrete import Discrete
-from gym import spaces
 
 from sc2learner.agents.replay_memory import Transition
 from sc2learner.agents.replay_memory import RemoteReplayMemory
 from sc2learner.utils.utils import tprint
 
 
+DQN_CHECKPOINT_VERSION = 1
+DQN_PROTOCOL_VERSION = 1
+
+
+def double_dqn_mmc_target(online_next_q, target_next_q, rewards, dones,
+                          mc_returns, discount, mmc_beta):
+  """Preserve the original DDQN bootstrap/MMC interpolation exactly."""
+  next_actions = online_next_q.argmax(dim=1, keepdim=True)
+  futures = target_next_q.gather(1, next_actions).squeeze(-1)
+  one_step = rewards + discount * futures * (1.0 - dones)
+  return one_step * mmc_beta + (1.0 - mmc_beta) * mc_returns
+
+
+def epsilon_schedule(steps, eps_start, eps_end, eps_decay_steps,
+                     eps_decay_steps2):
+  if steps < eps_decay_steps:
+    return eps_start - (eps_start - eps_end) * steps / eps_decay_steps
+  if steps < eps_decay_steps2:
+    # The denominator intentionally remains eps_decay_steps2 for parity.
+    return eps_end - (eps_end - 0.01) * (
+        steps - eps_decay_steps) / eps_decay_steps2
+  return 0.01
+
+
 class DQNAgent(object):
 
-  def __init__(self, network, action_space, init_model_path=None):
-    assert type(action_space) == spaces.Discrete
+  def __init__(self, network, action_space, init_model_path=None, *, device="cpu"):
+    if not hasattr(action_space, "n") or not callable(getattr(action_space, "sample", None)):
+      raise TypeError("action_space must provide n and sample()")
     self._action_space = action_space
-    self._network = network
-    if init_model_path is not None:
-      self.load_params(torch.load(init_model_path,
-                                  map_location=lambda storage, loc: storage))
-    if torch.cuda.device_count() > 1:
-      self._network = nn.DataParallel(self._network)
-    if torch.cuda.is_available(): self._network.cuda()
+    self.device = torch.device(device)
+    self._network = network.to(self.device)
     self._optimizer = None
     self._target_network = None
     self._num_optim_steps = 0
+    if init_model_path is not None:
+      self.load(init_model_path)
 
   def act(self, observation, eps=0):
     self._network.eval()
     if random.uniform(0, 1) >= eps:
-      observation = torch.from_numpy(np.expand_dims(observation, 0))
-      if torch.cuda.is_available():
-        observation = observation.pin_memory().cuda(non_blocking=True)
+      observation = torch.as_tensor(
+          np.expand_dims(observation, 0), dtype=torch.float32, device=self.device)
       with torch.no_grad():
         q = self._network(observation)
-        action = q.data.max(1)[1].item()
+        action = q.argmax(dim=1).item()
       return action
     else:
       return self._action_space.sample()
@@ -80,46 +91,43 @@ class DQNAgent(object):
     # create target network
     if self._target_network is None:
       self._target_network = deepcopy(self._network)
-      if torch.cuda.is_available(): self._target_network.cuda()
+      self._target_network.to(self.device)
       self._target_network.eval()
 
     # update target network
     if self._num_optim_steps % target_update_interval == 0:
       self._target_network.load_state_dict(self._network.state_dict())
 
-    # move to gpu
-    if torch.cuda.is_available():
-      obs_batch = obs_batch.cuda(non_blocking=True)
-      next_obs_batch = next_obs_batch.cuda(non_blocking=True)
-      action_batch = action_batch.cuda(non_blocking=True)
-      reward_batch = reward_batch.cuda(non_blocking=True)
-      mc_return_batch = mc_return_batch.cuda(non_blocking=True)
-      done_batch = done_batch.cuda(non_blocking=True)
+    obs_batch = obs_batch.to(self.device)
+    next_obs_batch = next_obs_batch.to(self.device)
+    action_batch = action_batch.to(self.device)
+    reward_batch = reward_batch.to(self.device)
+    mc_return_batch = mc_return_batch.to(self.device)
+    done_batch = done_batch.to(self.device)
 
     # compute max-q target
     self._network.eval()
     with torch.no_grad():
       q_next_target = self._target_network(next_obs_batch)
       q_next = self._network(next_obs_batch)
-      futures = q_next_target.gather(
-          1, q_next.max(dim=1)[1].view(-1, 1)).squeeze()
-      futures = futures * (1 - done_batch)
-      target_q = reward_batch + discount * futures
-      target_q = target_q * mmc_beta + (1.0 - mmc_beta) * mc_return_batch
+      target_q = double_dqn_mmc_target(
+          q_next, q_next_target, reward_batch, done_batch, mc_return_batch,
+          discount, mmc_beta)
 
     # define loss
     self._network.train()
-    q = self._network(obs_batch).gather(1, action_batch.view(-1, 1)).squeeze()
+    q = self._network(obs_batch).gather(1, action_batch.view(-1, 1)).squeeze(-1)
     loss = F.mse_loss(q, target_q.detach())
 
     # compute gradient and update parameters
     self._optimizer.zero_grad()
     loss.backward()
     for param in self._network.parameters():
-      param.grad.data.clamp_(-gradient_clipping, gradient_clipping)
+      if param.grad is not None:
+        param.grad.detach().clamp_(-gradient_clipping, gradient_clipping)
     self._optimizer.step()
     self._num_optim_steps += 1
-    return loss.data.item()
+    return loss.detach().item()
 
   def reset(self):
     pass
@@ -128,10 +136,38 @@ class DQNAgent(object):
     self._network.load_state_dict(state_dict)
 
   def read_params(self):
-    if torch.cuda.device_count() > 1:
-      return self._network.module.state_dict()
-    else:
-      return self._network.state_dict()
+    return {name: value.detach().cpu().clone()
+            for name, value in self._network.state_dict().items()}
+
+  def save(self, path):
+    torch.save({
+        "format_version": DQN_CHECKPOINT_VERSION,
+        "model_state_dict": self._network.state_dict(),
+        "target_state_dict": (
+            None if self._target_network is None else self._target_network.state_dict()),
+        "optimizer_state_dict": (
+            None if self._optimizer is None else self._optimizer.state_dict()),
+        "num_optim_steps": self._num_optim_steps,
+    }, path)
+
+  def load(self, path, *, load_training_state=False):
+    checkpoint = torch.load(path, map_location=self.device, weights_only=False)
+    # Weight-only checkpoints from the original PyTorch DQN remain loadable.
+    if "format_version" not in checkpoint:
+      self.load_params(checkpoint)
+      return
+    if checkpoint["format_version"] != DQN_CHECKPOINT_VERSION:
+      raise ValueError("unsupported DQN checkpoint format")
+    self.load_params(checkpoint["model_state_dict"])
+    if load_training_state:
+      if checkpoint["target_state_dict"] is not None:
+        self._target_network = deepcopy(self._network)
+        self._target_network.load_state_dict(checkpoint["target_state_dict"])
+        self._target_network.eval()
+      if checkpoint["optimizer_state_dict"] is not None:
+        self._optimizer = optim.Adam(self._network.parameters())
+        self._optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+      self._num_optim_steps = int(checkpoint["num_optim_steps"])
 
 
 class DQNActor(object):
@@ -144,14 +180,16 @@ class DQNActor(object):
                discount,
                send_freq=4.0,
                ports=("5700", "5701", "5702"),
-               learner_ip="localhost"):
-    assert type(env.action_space) == spaces.Discrete
+               learner_ip="localhost",
+               device="cpu"):
+    if not hasattr(env.action_space, "n"):
+      raise TypeError("environment action space must be discrete")
     assert len(ports) == 3
     self._env = env
     self._discount = discount
     self._epsilon = 1.0
 
-    self._agent = DQNAgent(network, env.action_space)
+    self._agent = DQNAgent(network, env.action_space, device=device)
     self._replay_memory = RemoteReplayMemory(
         is_server=False,
         memory_size=memory_size,
@@ -193,10 +231,16 @@ class DQNActor(object):
 
   def _update_model(self):
       self._model_requestor.send_string("request model")
-      file_object = io.BytesIO(self._model_requestor.recv_pyobj())
-      self._agent.load_params(
-          torch.load(file_object, map_location=lambda storage, loc: storage))
-      self._epsilon = self._model_requestor.recv_pyobj()
+      message = self._model_requestor.recv_pyobj()
+      if message.get("protocol_version") != DQN_PROTOCOL_VERSION:
+        raise ValueError("unsupported DQN synchronization protocol")
+      self._agent.load_params(message["parameters"])
+      self._epsilon = float(message["epsilon"])
+
+  def close(self):
+    self._model_requestor.close(linger=0)
+    if hasattr(self._replay_memory, "close"):
+      self._replay_memory.close()
 
 
 class DQNLearner(object):
@@ -221,18 +265,18 @@ class DQNLearner(object):
                checkpoint_interval,
                print_interval,
                ports=("5700", "5701", "5702"),
-               init_model_path=None):
-    assert type(action_space) == spaces.Discrete
-    self._agent = DQNAgent(network, action_space)
+               init_model_path=None,
+               device="cpu"):
+    if not hasattr(action_space, "n"):
+      raise TypeError("action space must be discrete")
+    self._agent = DQNAgent(network, action_space, device=device)
     self._replay_memory = RemoteReplayMemory(
         is_server=True,
         memory_size=memory_size,
         memory_warmup_size=memory_warmup_size,
         ports=ports[:2])
     if init_model_path is not None:
-      self._agent.load_params(
-          torch.load(init_model_path,
-                     map_location=lambda storage, loc: storage))
+      self._agent.load(init_model_path, load_training_state=True)
     self._model_params = self._agent.read_params()
 
     self._batch_size = batch_size
@@ -325,24 +369,20 @@ class DQNLearner(object):
     return observation, next_observation, action, reward, done, mc_return
 
   def _save_checkpoint(self, checkpoint_path):
-    torch.save(self._model_params, checkpoint_path)
+    self._agent.save(checkpoint_path)
 
   def _schedule_epsilon(self, steps):
-    if steps < self._eps_decay_steps:
-      return self._eps_start - (self._eps_start - self._eps_end) * \
-          steps / self._eps_decay_steps
-    elif steps < self._eps_decay_steps2:
-      return self._eps_end - (self._eps_end - 0.01) * \
-          (steps - self._eps_decay_steps) / self._eps_decay_steps2
-    else:
-      return 0.01
+    return epsilon_schedule(
+        steps, self._eps_start, self._eps_end,
+        self._eps_decay_steps, self._eps_decay_steps2)
 
   def _reply_model(self, zmq_context, port):
     receiver = zmq_context.socket(zmq.REP)
     receiver.bind("tcp://*:%s" % port)
     while True:
       assert receiver.recv_string() == "request model"
-      f = io.BytesIO()
-      torch.save(self._model_params, f)
-      receiver.send_pyobj(f.getvalue(), zmq.SNDMORE)
-      receiver.send_pyobj(self._epsilon)
+      receiver.send_pyobj({
+          "protocol_version": DQN_PROTOCOL_VERSION,
+          "parameters": self._model_params,
+          "epsilon": self._epsilon,
+      })
